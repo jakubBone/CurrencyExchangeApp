@@ -38,18 +38,24 @@ FILE: SecurityConfig.java
 
 package com.jakubbone.config;
 
-import com.jakubbone.utils.JwtTokenFilter;
-import com.jakubbone.utils.JwtTokenProvider;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
+import org.springframework.core.convert.converter.Converter;
 import org.springframework.security.config.annotation.method.configuration.EnableMethodSecurity;
 import org.springframework.security.config.annotation.web.builders.HttpSecurity;
 import org.springframework.security.config.annotation.web.configuration.EnableWebSecurity;
 import org.springframework.security.config.http.SessionCreationPolicy;
+import org.springframework.security.core.GrantedAuthority;
 import org.springframework.security.crypto.password.PasswordEncoder;
 import org.springframework.security.crypto.bcrypt.BCryptPasswordEncoder;
+import org.springframework.security.oauth2.jwt.Jwt;
+import org.springframework.security.oauth2.server.resource.authentication.JwtAuthenticationConverter;
 import org.springframework.security.web.SecurityFilterChain;
-import org.springframework.security.web.authentication.UsernamePasswordAuthenticationFilter;
+import org.springframework.security.core.authority.SimpleGrantedAuthority;
+import java.util.Collection;
+import java.util.List;
+import java.util.Map;
+import java.util.stream.Collectors;
 
 /**
  * Security configuration enabling JWT filter and method security.
@@ -59,11 +65,6 @@ import org.springframework.security.web.authentication.UsernamePasswordAuthentic
 @EnableWebSecurity
 @EnableMethodSecurity(prePostEnabled = true)
 public class SecurityConfig {
-    private JwtTokenProvider jwtTokenProvider;
-
-    public SecurityConfig(JwtTokenProvider jwtTokenProvider) {
-        this.jwtTokenProvider = jwtTokenProvider;
-    }
 
     @Bean
     public SecurityFilterChain filterChain(HttpSecurity http) throws Exception {
@@ -71,16 +72,46 @@ public class SecurityConfig {
                 .sessionManagement().sessionCreationPolicy(SessionCreationPolicy.STATELESS)
                 .and()
                 .authorizeHttpRequests(auth -> auth
-                        .requestMatchers("/api/messages").authenticated() // the rest requires JWT authentication
-                        .anyRequest().permitAll()
+                        .requestMatchers(("/api/v1/messages")).hasAnyRole("USER", "ADMIN")
+                        .requestMatchers("/api/v1/login", "/api/v1/register", "/api/v1/info", "api/v1/uptime").permitAll()
+                        .anyRequest().authenticated()
                 )
-                .addFilterBefore(new JwtTokenFilter(jwtTokenProvider), UsernamePasswordAuthenticationFilter.class);
+                .oauth2ResourceServer(oauth2 -> oauth2
+                        .jwt(jwt -> jwt
+                                .jwtAuthenticationConverter(jwtAuthenticationConverter())
+                        )
+                );
         return http.build();
+    }
+
+    @Bean
+    public JwtAuthenticationConverter jwtAuthenticationConverter() {
+        JwtAuthenticationConverter converter = new JwtAuthenticationConverter();
+        converter.setJwtGrantedAuthoritiesConverter(new KeycloakRoleConverter());
+        return converter;
     }
 
     @Bean
     public PasswordEncoder passwordEncoder() {
         return new BCryptPasswordEncoder();
+    }
+
+    // Extracting roles converter from Keycloak JWT
+    static class KeycloakRoleConverter implements Converter<Jwt, Collection<GrantedAuthority>> {
+        @Override
+        public Collection<GrantedAuthority> convert(Jwt jwt) {
+            // Extract realm roles
+            Map<String, Object> realmAccess = (Map<String, Object>) jwt.getClaims().get("realm_access");
+            if (realmAccess == null || realmAccess.isEmpty()) {
+                return List.of();
+            }
+
+            List<String> roles = (List<String>) realmAccess.get("roles");
+            return roles.stream()
+                    .map(role -> "ROLE_" + role)
+                    .map(SimpleGrantedAuthority::new)
+                    .collect(Collectors.toList());
+        }
     }
 }
 
@@ -100,7 +131,7 @@ import java.util.Collections;
 import java.util.Map;
 
 @RestController
-@RequestMapping("/api")
+@RequestMapping("/api/v1")
 public class InfoController {
     @Value("${spring.application.version}")
     private String version;
@@ -119,66 +150,6 @@ public class InfoController {
 }
 
 ====================
-FILE: LoginController.java
-
-package com.jakubbone.controller;
-
-import com.jakubbone.dto.LoginRequest;
-import com.jakubbone.model.User;
-import com.jakubbone.repository.UserRepository;
-import com.jakubbone.utils.JwtTokenProvider;
-import org.springframework.http.HttpStatus;
-import org.springframework.http.ResponseEntity;
-
-import org.springframework.security.crypto.password.PasswordEncoder;
-import org.springframework.web.bind.annotation.PostMapping;
-import org.springframework.web.bind.annotation.RequestBody;
-import org.springframework.web.bind.annotation.RequestMapping;
-import org.springframework.web.bind.annotation.RestController;
-
-import java.util.Collections;
-import java.util.Map;
-import java.util.Optional;
-
-@RestController
-@RequestMapping("/api")
-public class LoginController {
-    private final PasswordEncoder encoder;
-    private final UserRepository userRepository;
-    private final JwtTokenProvider jwtTokenProvider;
-
-    public LoginController(PasswordEncoder encoder, UserRepository userRepository, JwtTokenProvider tokenProvider) {
-        this.encoder = encoder;
-        this.userRepository = userRepository;
-        this.jwtTokenProvider = tokenProvider;
-    }
-
-    @PostMapping("/login")
-    public ResponseEntity<?> login(@RequestBody LoginRequest req) {
-        String username = req.getUsername();
-        String password = req.getPassword();
-
-        Optional<User> userOpt = userRepository.findByUsername(username);
-
-        if (userOpt.isEmpty()){
-            // Return a generic HTTP 401 Unauthorized response without specifying
-            // whether the username or the password is incorrect
-            return ResponseEntity.status(HttpStatus.UNAUTHORIZED).body("Invalid username or password");
-        }
-
-        User user = userOpt.get();
-
-        if (!encoder.matches(password, user.getPasswordHash())){
-            return ResponseEntity.status(HttpStatus.UNAUTHORIZED).body("Invalid username or password");
-        }
-
-        String token = jwtTokenProvider.createToken(user.getUsername(), String.valueOf(user.getRole()));
-        Map<String, String> responseBody = Collections.singletonMap("token", token);
-        return ResponseEntity.ok(responseBody);
-    }
-}
-
-====================
 FILE: MessageController.java
 
 package com.jakubbone.controller;
@@ -186,7 +157,9 @@ package com.jakubbone.controller;
 import com.jakubbone.dto.SendMessageRequest;
 import com.jakubbone.model.Message;
 import com.jakubbone.service.MessageService;
+import com.jakubbone.utils.ResponseHandler;
 import jakarta.validation.Valid;
+import org.springframework.security.access.prepost.PreAuthorize;
 import org.springframework.security.core.Authentication;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
@@ -195,20 +168,23 @@ import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RestController;
 
+import java.util.Map;
+
 @RestController
-@RequestMapping("/api/messages")
+@RequestMapping("/api/v1/messages")
+@PreAuthorize("hasAnyRole('ADMIN', 'USER')")
 public class MessageController {
-    private MessageService messageService;
+    private final MessageService messageService;
 
     public MessageController(MessageService messageService) {
         this.messageService = messageService;
     }
 
     @PostMapping
-    public ResponseEntity<Message> sendMessage(@Valid @RequestBody SendMessageRequest req, Authentication authentication){
+    public ResponseEntity<Map<String, Object>> sendMessage(@Valid @RequestBody SendMessageRequest req, Authentication authentication){
         String senderUsername = authentication.getName();
         Message savedMessage = messageService.sendMessage(senderUsername, req.getTo(), req.getText());
-        return ResponseEntity.status(HttpStatus.CREATED).body(savedMessage);
+        return ResponseHandler.success(HttpStatus.CREATED, savedMessage);
     }
 }
 
@@ -260,6 +236,7 @@ FILE: GlobalExceptionHandler.java
 
 package com.jakubbone.exception;
 
+import com.jakubbone.utils.ResponseHandler;
 import io.jsonwebtoken.JwtException;
 import lombok.extern.log4j.Log4j2;
 import org.springframework.dao.DataAccessException;
@@ -271,6 +248,8 @@ import org.springframework.web.bind.annotation.ControllerAdvice;
 import org.springframework.web.bind.annotation.ExceptionHandler;
 import org.springframework.web.server.ResponseStatusException;
 
+import java.util.Map;
+
 @ControllerAdvice
 // or @RestControllerAdvice -> acts as @ControllerAdvice + @ResponseBody for all methods
 @Log4j2
@@ -279,61 +258,58 @@ public class GlobalExceptionHandler {
     // Handles JWT-related exceptions (e.g. invalid or expired token)
     // HTTP Status: 401 Unauthorized
     @ExceptionHandler(JwtException.class)
-    public ResponseEntity<String> handleJwtException(JwtException e){
-        log.error("JWT error occurred: {}", e.getMessage(), e);
-        return ResponseEntity.status(HttpStatus.UNAUTHORIZED).body("Invalid JWT token");
+    public ResponseEntity<Map<String,Object>> handleJwtException(JwtException e){
+        log.error("JWT error occurred: {}", e.getMessage());
+        return ResponseHandler.error(HttpStatus.UNAUTHORIZED, "Invalid JWT token");
     }
 
     // Handles invalid method arguments (e.g. illegal or unexpected input)
     // HTTP Status: 400 Bad Request
     @ExceptionHandler(IllegalArgumentException.class)
-    public ResponseEntity<String> handleIllegalArgumentException(IllegalArgumentException e){
-        log.error("Illegal argument exception: {}", e.getMessage(), e);
-        return ResponseEntity.status(HttpStatus.UNAUTHORIZED).body("Invalid argument: " + e.getMessage());
+    public ResponseEntity<Map<String,Object>> handleIllegalArgumentException(IllegalArgumentException e){
+        log.error("Illegal argument exception: {}", e.getMessage());
+        return ResponseHandler.error(HttpStatus.BAD_REQUEST, "Invalid argument: " + e.getMessage());
     }
 
     // Handles ResponseStatusException (thrown manually with a custom HTTP status)
     // HTTP Status: Defined by exception (dynamic)
     @ExceptionHandler(ResponseStatusException.class)
-    public ResponseEntity<String> handleResponseStatusException(ResponseStatusException e){
+    public ResponseEntity<Map<String,Object>> handleResponseStatusException(ResponseStatusException e){
         log.warn("Invalid argument provided: {}", e.getMessage());
-        return ResponseEntity.status(e.getStatusCode()).body(e.getReason());
+        return ResponseHandler.error(e.getStatusCode(),  e.getReason());
     }
 
     // Handles database-related exceptions
     // HTTP Status: 500 Internal Server Error
     @ExceptionHandler(DataAccessException.class)
-    public ResponseEntity<String> handleDataAccessException(DataAccessException e) {
-        log.error("Database error occurred: {}", e.getMessage(), e);
-        return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR).body("Internal server error");
+    public ResponseEntity<?> handleDataAccessException(DataAccessException e) {
+        log.error("Database error occurred: {}", e.getMessage());
+        return ResponseHandler.error(HttpStatus.INTERNAL_SERVER_ERROR, "Internal server error");
     }
 
     // Handles case when user is not found in the system (e.g. during authentication)
     // HTTP Status: 404 Not Found
     @ExceptionHandler(UsernameNotFoundException.class)
-    public ResponseEntity<String> handleUserNotFound(UsernameNotFoundException e) {
-        log.error("User not found: {}", e.getMessage(), e);
-        return ResponseEntity.status(HttpStatus.NOT_FOUND).body("User not found");
+    public ResponseEntity<Map<String,Object>> handleUserNotFound(UsernameNotFoundException e) {
+        log.error("User not found: {}", e.getMessage());
+        return ResponseHandler.error(HttpStatus.NOT_FOUND, "User not found");
     }
 
     // Handles validation errors for incoming request data (e.g. @Valid fails)
     // HTTP Status: 400 Bad Request
     @ExceptionHandler(MethodArgumentNotValidException.class)
-    public ResponseEntity<String> handleValidationException(MethodArgumentNotValidException e) {
-        log.error("Invalid request data: {}", e.getMessage(), e);
-        return ResponseEntity.status(HttpStatus.NOT_FOUND).body("Invalid request data");
+    public ResponseEntity<Map<String,Object>> handleValidationException(MethodArgumentNotValidException e) {
+        log.error("Invalid request data: {}", e.getMessage());
+        return ResponseHandler.error(HttpStatus.BAD_REQUEST, "Invalid request data");
     }
-
 
     // Catches any other unhandled exceptions (generic)
     // HTTP Status: 500 Internal Server Error
     @ExceptionHandler(Exception.class)
-    public ResponseEntity<String> handleGenericException(Exception e) {
-        log.error("Unexpected error occurred: {}", e.getMessage(), e);
-        return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR).body("Unexpected error occurred");
+    public ResponseEntity<Map<String,Object>> handleGenericException(Exception e) {
+        log.error("Unexpected error occurred: {}", e.getMessage());
+        return ResponseHandler.error(HttpStatus.INTERNAL_SERVER_ERROR, "Unexpected error occurred");
     }
-
-
 }
 
 ====================
@@ -462,8 +438,9 @@ import com.jakubbone.model.Message;
 import com.jakubbone.model.User;
 import com.jakubbone.repository.MessageRepository;
 import com.jakubbone.repository.UserRepository;
-import org.springframework.security.core.userdetails.UsernameNotFoundException;
+import org.springframework.http.HttpStatus;
 import org.springframework.stereotype.Service;
+import org.springframework.web.server.ResponseStatusException;
 
 import java.time.LocalDateTime;
 
@@ -480,9 +457,9 @@ public class MessageServiceImpl implements MessageService {
     @Override
     public Message sendMessage(String fromUsername, String toUsername, String content) {
         User sender = userRepository.findByUsername(fromUsername)
-                .orElseThrow(() -> new UsernameNotFoundException("Sender not found"));
+                .orElseThrow(() -> new ResponseStatusException(HttpStatus.NOT_FOUND, "Sender not found"));
         User recipient = userRepository.findByUsername(toUsername)
-                .orElseThrow(() -> new UsernameNotFoundException("Recipient not found"));
+                .orElseThrow(() -> new ResponseStatusException(HttpStatus.NOT_FOUND, "Recipient not found"));
 
         Message msg = new Message();
         msg.setSender(sender);
@@ -510,116 +487,59 @@ public class SpringBootMailingApplication {
 }
 
 ====================
-FILE: JwtTokenFilter.java
+FILE: ResponseHandler.java
 
 package com.jakubbone.utils;
 
-import io.jsonwebtoken.Claims;
-import io.jsonwebtoken.JwtException;
-import io.jsonwebtoken.Jwts;
-import jakarta.servlet.FilterChain;
-import jakarta.servlet.ServletException;
-import jakarta.servlet.http.HttpServletRequest;
-import jakarta.servlet.http.HttpServletResponse;
-import org.springframework.core.Ordered;
-import org.springframework.core.annotation.Order;
 import org.springframework.http.HttpStatus;
-import org.springframework.security.authentication.UsernamePasswordAuthenticationToken;
-import org.springframework.security.core.authority.SimpleGrantedAuthority;
-import org.springframework.security.core.context.SecurityContextHolder;
-import org.springframework.stereotype.Component;
-import org.springframework.web.filter.OncePerRequestFilter;
-import org.springframework.web.server.ResponseStatusException;
+import org.springframework.http.HttpStatusCode;
+import org.springframework.http.ResponseEntity;
 
-import java.io.IOException;
-import java.util.List;
+import java.time.Instant;
+import java.util.Map;
 
-/**
- * Filter that validates JWT tokens and enforces ADMIN role.
- * Skipped for public endpoints; throws 403 if role is not ADMIN.
- */
-@Component
-@Order(Ordered.HIGHEST_PRECEDENCE)
-public class JwtTokenFilter extends OncePerRequestFilter {
-    private JwtTokenProvider jwtTokenProvider;
+public class ResponseHandler {
 
-    public JwtTokenFilter(JwtTokenProvider jwtTokenProvider) {
-        this.jwtTokenProvider = jwtTokenProvider;
+    // envelope for status OK (200)
+    public static ResponseEntity<Map<String,Object>> success(Object data) {
+        Map<String,Object> body = Map.of(
+                "timestamp", Instant.now().toString(),
+                "statusCode", HttpStatus.OK.value(),
+                "data", data
+        );
+        return ResponseEntity.ok(body);
     }
 
-    @Override
-    protected void doFilterInternal(HttpServletRequest request, HttpServletResponse response, FilterChain filterChain) throws ServletException, IOException {
-        String authHeader = request.getHeader("Authorization");
-        if (authHeader != null && authHeader.startsWith("Bearer ")) {
-            String token = authHeader.substring(7);
-            try {
-                // Token validation
-                Claims claims = Jwts.parser()
-                        .setSigningKey(jwtTokenProvider.getSecretKey())
-                        .parseClaimsJws(token)
-                        .getBody();
-
-                String username = claims.getSubject();
-                String role = claims.get("role", String.class);
-
-                if (!"ADMIN".equals(role)) {
-                    response.sendError(HttpStatus.UNAUTHORIZED.value(), "Admin role required");
-                    return;
-                }
-
-                // Authentication building with prefix ROLE_
-                var authorities = List.of(
-                        new SimpleGrantedAuthority("ROLE_" + role)
-                );
-                var auth = new UsernamePasswordAuthenticationToken(
-                        username, null, authorities
-                );
-
-                // 3) Add auth to Security Context to authorize request
-                SecurityContextHolder.getContext().setAuthentication(auth);
-
-            } catch (JwtException | IllegalArgumentException ex) {
-                response.sendError(HttpStatus.UNAUTHORIZED.value(), "Invalid or expired token");
-                return;
-            }
-        }
-        filterChain.doFilter(request, response);
+    // envelope for another status (e.g. CREATED)
+    public static ResponseEntity<Map<String,Object>> success(HttpStatus status, Object data) {
+        Map<String,Object> body = Map.of(
+                "timestamp", Instant.now().toString(),
+                "statusCode",    status.value(),
+                "status",    status.getReasonPhrase(),
+                "data",      data
+        );
+        return ResponseEntity.status(status).body(body);
     }
-}
 
-====================
-FILE: JwtTokenProvider.java
+    // envelope for error (HttpStatus)
+    public static ResponseEntity<Map<String,Object>> error(HttpStatus status, String message) {
+        Map<String,Object> body = Map.of(
+                "timestamp", Instant.now().toString(),
+                "errorCode", status.value(),
+                "error", status.getReasonPhrase(),
+                "message", message
+        );
+        return ResponseEntity.status(status).body(body);
+    }
 
-package com.jakubbone.utils;
-
-import io.jsonwebtoken.Jwts;
-import io.jsonwebtoken.SignatureAlgorithm;
-import lombok.Getter;
-import org.springframework.beans.factory.annotation.Value;
-import org.springframework.stereotype.Component;
-
-import java.util.Date;
-
-@Component
-@Getter
-public class JwtTokenProvider {
-    @Value("${jwt.secret}")
-    private String secretKey;
-
-    @Value("${jwt.expiration}")
-    private long expirationMillis;
-
-    public String createToken(String username, String role){
-        Date now = new Date();
-        Date expiryDate = new Date(now.getTime() + expirationMillis);
-
-        return Jwts.builder()
-                .setSubject(username)         // set token subject (username)
-                .claim("role", role)       // own field (role)
-                .setIssuedAt(now)             // release time
-                .setExpiration(expiryDate)    // expiration time
-                .signWith(SignatureAlgorithm.HS512, secretKey)  // sign with HS512 algorithm and secret
-                .compact();
+    // envelope for error (HttpStatusCode)
+    public static ResponseEntity<Map<String, Object>> error(HttpStatusCode statusCode, String message) {
+        Map<String,Object> body = Map.of(
+                "timestamp", Instant.now().toString(),
+                "errorCode", statusCode.value(),
+                "message", message
+        );
+        return ResponseEntity.status(statusCode).body(body);
     }
 }
 
@@ -830,7 +750,7 @@ class MessageControllerTest {
     }
 
     @Test
-    void shouldReturn201_whenValidToken(@Autowired MockMvc mockMvc) throws Exception {
+    void shouldReturn201_whenAdminValidToken(@Autowired MockMvc mockMvc) throws Exception {
         SendMessageRequest req = new SendMessageRequest("testUser", "Hello user!");
         mockMvc.perform(post("/api/messages")
                         .header(HttpHeaders.AUTHORIZATION, "Bearer " + adminToken)
@@ -838,36 +758,26 @@ class MessageControllerTest {
                         .content(mapper.writeValueAsBytes(req)))
                 .andDo(MockMvcResultHandlers.print())
                 .andExpect(status().isCreated())
-                .andExpect(jsonPath("$.id").exists())
-                .andExpect(jsonPath("$.sender.username").value("testAdmin"))
-                .andExpect(jsonPath("$.recipient.username").value("testUser"))
-                .andExpect(jsonPath("$.content").value("Hello user!"));
+                .andExpect(jsonPath("$.data.id").exists())
+                .andExpect(jsonPath("$.data.sender.username").value("testAdmin"))
+                .andExpect(jsonPath("$.data.recipient.username").value("testUser"))
+                .andExpect(jsonPath("$.data.content").value("Hello user!"));
     }
 
 
     @Test
-    void shouldReturn401_whenInvalidToken(@Autowired MockMvc mockMvc) throws Exception {
-        SendMessageRequest req = new SendMessageRequest("testUser", "Hello user!");
-
+    void shouldReturn401_whenUserValidToken(@Autowired MockMvc mockMvc) throws Exception {
+        SendMessageRequest req = new SendMessageRequest("testAdmin", "Hello admin!");
         mockMvc.perform(post("/api/messages")
-                    .header(HttpHeaders.AUTHORIZATION, "Bearer " + userToken)
-                    .contentType(MediaType.APPLICATION_JSON)
-                    .content(mapper.writeValueAsBytes(req)))
+                        .header(HttpHeaders.AUTHORIZATION, "Bearer " + userToken)
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(mapper.writeValueAsBytes(req)))
                 .andDo(MockMvcResultHandlers.print())
-                .andExpect(status().isUnauthorized());
-
-    }
-
-    @Test
-    void shouldReturn201_whenInvalidPayload(@Autowired MockMvc mockMvc) throws Exception {
-        SendMessageRequest req = new SendMessageRequest("testUser", "Hello user!");
-
-        mockMvc.perform(post("/api/messages")
-                    .header(HttpHeaders.AUTHORIZATION, "Bearer " + userToken)
-                    .contentType(MediaType.APPLICATION_JSON)
-                    .content(mapper.writeValueAsBytes(req)))
-                .andDo(MockMvcResultHandlers.print())
-                .andExpect(status().isUnauthorized());
+                .andExpect(status().isCreated())
+                .andExpect(jsonPath("$.data.id").exists())
+                .andExpect(jsonPath("$.data.sender.username").value("testUser"))
+                .andExpect(jsonPath("$.data.recipient.username").value("testAdmin"))
+                .andExpect(jsonPath("$.data.content").value("Hello admin!"));
 
     }
 
@@ -893,7 +803,7 @@ class MessageControllerTest {
                     .contentType(MediaType.APPLICATION_JSON)
                     .content(mapper.writeValueAsBytes(req)))
                 .andDo(MockMvcResultHandlers.print())
-                .andExpect(status().isNotFound());
+                .andExpect(status().isBadRequest());
     }
 }
 
