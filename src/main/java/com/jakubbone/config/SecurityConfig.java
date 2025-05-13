@@ -53,11 +53,6 @@ public class SecurityConfig {
         return converter;
     }
 
-    @Bean
-    public PasswordEncoder passwordEncoder() {
-        return new BCryptPasswordEncoder();
-    }
-
     // Extracting roles converter from Keycloak JWT
     static class KeycloakRoleConverter implements Converter<Jwt, Collection<GrantedAuthority>> {
         @Override
