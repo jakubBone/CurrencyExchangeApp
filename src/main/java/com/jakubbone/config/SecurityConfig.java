@@ -37,7 +37,11 @@ public class SecurityConfig {
                         .requestMatchers("/api/v1/login", "/api/v1/register", "/api/v1/info", "api/v1/uptime").permitAll()
                         .anyRequest().authenticated()
                 )
-                .addFilterBefore(new JwtTokenFilter(jwtTokenProvider), UsernamePasswordAuthenticationFilter.class);
+                .oauth2ResourceServer(oauth2 -> oauth2
+                        .jwt(jwt -> jwt
+                                .jwtAuthenticationConverter(jwtAuthenticationConverter())
+                        )
+                );
         return http.build();
     }
 
