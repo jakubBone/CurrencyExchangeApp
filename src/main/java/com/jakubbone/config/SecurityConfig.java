@@ -8,8 +8,6 @@ import org.springframework.security.config.annotation.web.builders.HttpSecurity;
 import org.springframework.security.config.annotation.web.configuration.EnableWebSecurity;
 import org.springframework.security.config.http.SessionCreationPolicy;
 import org.springframework.security.core.GrantedAuthority;
-import org.springframework.security.crypto.password.PasswordEncoder;
-import org.springframework.security.crypto.bcrypt.BCryptPasswordEncoder;
 import org.springframework.security.oauth2.jwt.Jwt;
 import org.springframework.security.oauth2.server.resource.authentication.JwtAuthenticationConverter;
 import org.springframework.security.web.SecurityFilterChain;
@@ -34,8 +32,8 @@ public class SecurityConfig {
                 .sessionManagement().sessionCreationPolicy(SessionCreationPolicy.STATELESS)
                 .and()
                 .authorizeHttpRequests(auth -> auth
-                        .requestMatchers(("/api/v1/messages")).hasAnyRole("USER", "ADMIN")
-                        .requestMatchers("/api/v1/login", "/api/v1/register", "/api/v1/info", "api/v1/uptime").permitAll()
+                        .requestMatchers(("/api/v1/messages")).authenticated()
+                        .requestMatchers("/api/v1/login", "/api/v1/register", "/api/v1/info", "/api/v1/uptime").permitAll()
                         .anyRequest().authenticated()
                 )
                 .oauth2ResourceServer(oauth2 -> oauth2
@@ -64,6 +62,7 @@ public class SecurityConfig {
             }
 
             List<String> roles = (List<String>) realmAccess.get("roles");
+
             return roles.stream()
                     .map(role -> "ROLE_" + role)
                     .map(SimpleGrantedAuthority::new)
