@@ -288,6 +288,23 @@ class MessageTest extends AbstractIntegrationTest {
                 .andExpect(jsonPath("$.last").value(true));
     }
 
+    // Searching test: edge cases
+    @Test
+    void shouldReturn400_whenSearchPhraseIsEmpty() throws Exception {
+        mockMvc.perform(get("/api/v1/messages/search")
+                        .header(HttpHeaders.AUTHORIZATION, "Bearer " + userToken)
+                        .param("phrase", ""))
+                .andExpect(status().isBadRequest());
+    }
+
+    @Test
+    void shouldReturn400_whenSearchPhraseIsWhitespace() throws Exception {
+        mockMvc.perform(get("/api/v1/messages/search")
+                        .header(HttpHeaders.AUTHORIZATION, "Bearer " + userToken)
+                        .param("phrase", "   "))
+                .andExpect(status().isBadRequest());
+    }
+
     @Test
     void shouldReturn200_andEmptyPageOfMessages_whenRecipientNoHasMessages() throws Exception {
         mockMvc.perform(get("/api/v1/messages")
@@ -300,10 +317,20 @@ class MessageTest extends AbstractIntegrationTest {
     }
 
     @Test
-    void shouldReturn404_whenUnauthorized() throws Exception {
+    void shouldReturn404_whenExpiredOrInvalid() throws Exception {
         mockMvc.perform(get("/api/v1/messages")
-                        .header(HttpHeaders.AUTHORIZATION, "Bearer " + "unknown"))
+                        .header(HttpHeaders.AUTHORIZATION, "Bearer " + "invalid"))
                 .andDo(MockMvcResultHandlers.print())
+                .andExpect(status().isUnauthorized());
+    }
+
+    @Test
+    void shouldReturn401_whenNoAuthorizationHeader() throws Exception {
+        SendMessageRequest req = createMessageRequest(user, "Hello testuser!");
+
+        mockMvc.perform(post("/api/v1/messages")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(mapper.writeValueAsBytes(req)))
                 .andExpect(status().isUnauthorized());
     }
 
